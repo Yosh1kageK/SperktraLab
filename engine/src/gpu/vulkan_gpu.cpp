@@ -17,6 +17,7 @@
 #include "volk.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -57,7 +58,13 @@ namespace {
 constexpr uint32_t kWorkgroup = 256;
 
 std::string vk_error(const char* operation, VkResult result) {
-    return std::string(operation) + " failed (VkResult " + std::to_string(int(result)) + ")";
+    std::string text = std::string(operation) + " failed (VkResult " + std::to_string(int(result)) + ")";
+    if (result == VK_ERROR_DEVICE_LOST)
+        text += ": the device was lost (the GPU was reset under this process -- a Windows TDR, "
+                "a driver fault, or a frame whose working set this adapter could not sustain). "
+                "No Vulkan call on a lost device is defined, so the engine issues no further "
+                "work and the app must be restarted before it renders again";
+    return text;
 }
 
 struct KernelSpec { const char* name; uint32_t bindings; uint32_t workgroup; };
@@ -608,6 +615,7 @@ public:
     bool dispatch(const char* kernel, const std::vector<Arg>& args,
                   size_t n_threads, std::string& error) override {
         if (n_threads == 0) return true;
+        if (!device_usable(error)) return false;
         // Probe kernels must not recurse into the startup gate. A rejected
         // device stays rejected, including low-level callers that dispatch
         // without first calling check_math_mode themselves.
@@ -702,7 +710,10 @@ public:
         return submitted;
     }
 
-    bool flush(std::string&) override { return true; }  // dispatch is synchronous for this milestone
+    // Dispatch is synchronous for this milestone, so there is never work to
+    // queue -- but a lost device has to keep failing here too, or a caller
+    // that only flushes would believe the frame still landed.
+    bool flush(std::string& error) override { return device_usable(error); }
     void* texture(Buffer* buffer, uint32_t width, uint32_t height,
                   uint32_t row_stride_px, std::string& error) override {
         if (!buffer || width == 0 || height == 0 || row_stride_px < width ||
@@ -831,10 +842,30 @@ private:
             static_cast<unsigned long long>(read_staging_.allocation_bytes));
     }
 
+    // A lost VkDevice is terminal for this backend: every later call on it is
+    // undefined, and the driver answers each one with VK_ERROR_DEVICE_LOST or
+    // nothing at all. The first one is latched, so the rest of the frame and
+    // every later frame fail fast with that one diagnosis instead of handing
+    // an invalid device to the driver node after node.
+    bool device_usable(std::string& error) const {
+        if (!device_lost_.load(std::memory_order_acquire)) return true;
+        std::lock_guard<std::mutex> lock(device_lost_mutex_);
+        error = device_lost_error_;
+        return false;
+    }
+
+    void latch_device_lost(VkResult result, const char* operation) {
+        if (result != VK_ERROR_DEVICE_LOST) return;
+        std::lock_guard<std::mutex> lock(device_lost_mutex_);
+        if (!device_lost_.exchange(true, std::memory_order_acq_rel))
+            device_lost_error_ = vk_error(operation, result);
+    }
+
     // Caller holds dispatch_mutex_: one queue and command pool, and synchronous
     // completion before any staging allocation or pooled buffer can be reused.
     template <typename Record>
     bool submit_sync(Record&& record, const char* operation, std::string& error) {
+        if (!device_usable(error)) return false;
         VkCommandBufferAllocateInfo allocate_info{};
         allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocate_info.commandPool = command_pool_;
@@ -861,7 +892,11 @@ private:
             }
             vkFreeCommandBuffers(device_, command_pool_, 1, &command);
         }
-        if (result != VK_SUCCESS) { error = vk_error(operation, result); return false; }
+        if (result != VK_SUCCESS) {
+            latch_device_lost(result, operation);
+            error = vk_error(operation, result);
+            return false;
+        }
         return true;
     }
 
@@ -1073,7 +1108,11 @@ private:
                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         VkResult result = vkCreateBuffer(device_, &create, nullptr, &b.handle);
-        if (result != VK_SUCCESS) { error = vk_error("vkCreateBuffer", result); return false; }
+        if (result != VK_SUCCESS) {
+            latch_device_lost(result, "vkCreateBuffer");
+            error = vk_error("vkCreateBuffer", result);
+            return false;
+        }
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(device_, b.handle, &requirements);
         uint32_t memory_index = UINT32_MAX;
@@ -1260,6 +1299,12 @@ private:
     Buffer read_staging_;
     size_t staging_chunk_bytes_ = kMaxStagingBytes;
     bool transfer_timings_ = false;
+    // First VK_ERROR_DEVICE_LOST seen, latched: the device is gone for good,
+    // and every later submission would be undefined. Mutable state guarded by
+    // its own mutex, because flush() reads it without the dispatch lock.
+    std::atomic<bool> device_lost_{false};
+    mutable std::mutex device_lost_mutex_;
+    std::string device_lost_error_;
     std::vector<Buffer*> buffers_;
     PoolAudit audit_;
     size_t frame_high_water_ = 0;
